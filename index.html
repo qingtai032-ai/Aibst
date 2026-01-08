@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AI Live2D Parts Clipper (iPad Edition)</title>
+    <script type="module">
+        import { env, pipeline } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.14.0';
+
+        // WorkerのURLを直接指定 (GitHub PagesでCSPの問題を避けるため)
+        env.localModelPath = 'https://huggingface.co/Xenova/sam_vit_b/resolve/main/';
+        env.allowRemoteModels = true; // リモートモデルのダウンロードを許可
+        env.use  = 'onnx'; // ONNX Runtime Web を使用
+        env.backends.onnx.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.14.0/dist/'; // WASMパスを指定
+
+        let segmenter = null;
+        let originalImageInput = null;
+        let imageHasBeenProcessed = false;
+
+        const loadModel = async () => {
+            document.getElementById('status').innerText = 'AIモデルをダウンロード中... (初回のみ数分かかります)';
+            segmenter = await pipeline('image-segmentation', 'Xenova/sam_vit_b');
+            document.getElementById('status').innerText = 'AIモデルの準備完了。画像を読み込んでください。';
+        };
+
+        loadModel(); // ページロード時にAIモデルのダウンロードを開始
+
+        // AIによる自動選択をトリガーする関数
+        window.autoSelectByAI = async (x, y) => {
+            if (!segmenter || !originalImageInput) {
+                document.getElementById('status').innerText = 'AIまたは画像が準備できていません。';
+                return;
+            }
+
+            document.getElementById('status').innerText = 'AIがオブジェクトを検出中...';
+            // SAMに渡すための画像データを準備
+            const imageData = {
+                data: originalImageInput.getImageData(0, 0, originalImageInput.canvas.width, originalImageInput.canvas.height).data,
+                width: originalImageInput.canvas.width,
+                height: originalImageInput.canvas.height,
+            };
+
+            const outputs = await segmenter(imageData, {
+                points: [[x, y]],
+                // ここで 'Xenova/sam_vit_b' の出力形式に合わせて調整が必要になる可能性があります
+                // 現在のtransformers.jsのAPIは、segmentation maskを直接返却
+            });
+            document.getElementById('status').innerText = 'AI検出完了。';
+
+            // outputsはセグメンテーションマスクの配列です。
+            // 最初のマスク（最もスコアが高いと仮定）を使用します。
+            if (outputs && outputs.length > 0) {
+                const mask = outputs[0].mask; // binary mask (0 or 1)
+                
+                // マスクから輪郭を生成する（Canvas APIで描画可能なパスに変換）
+                const contourPoints = getContourFromMask(mask);
+                
+                if (contourPoints.length > 0) {
+                    window.setCurrentSelection(contourPoints); // グローバル関数でCanvasに描画
+                    imageHasBeenProcessed = true; // AI処理が行われたことをマーク
+                } else {
+                    document.getElementById('status').innerText = 'AIは何も検出できませんでした。';
+                }
+            } else {
+                document.getElementById('status').innerText = 'AIは何も検出できませんでした。';
+            }
+        };
+
+        // バイナリマスクから輪郭を抽出するヘルパー関数
+        function getContourFromMask(mask) {
+            const points = [];
+            const width = mask.width;
+            const height = mask.height;
+            const data = mask.data; // 0 or 1
+
+            // 簡易的な輪郭抽出アルゴリズム
+            // 各ピクセルを見て、隣接ピクセルとの値が異なる場合に輪郭とみなす
+            for (let y = 0; y < height; y++) {
+                for (let x = 0; x < width; x++) {
+                    const idx = y * width + x;
+                    if (data[idx] === 1) { // マスクされたピクセル
+                        // 上下左右のいずれかがマスクされていないか、範囲外であれば輪郭
+                        const isBoundary = 
+                            (x === 0 || data[idx - 1] === 0) || // 左
+                            (x === width - 1 || data[idx + 1] === 0) || // 右
+                            (y === 0 || data[idx - width] === 0) || // 上
+                            (y === height - 1 || data[idx + width] === 0); // 下
+                        
+                        if (isBoundary) {
+                            points.push({ x, y });
+                        }
+                    }
+                }
+            }
+            // より洗練された輪郭抽出（例：Marching Squaresアルゴリズムなど）が必要になる場合もあります。
+            // ここでは簡易的に、隣接ピクセルとの差で検出しています。
+            // また、点を繋いでパスにするロジックも必要です。これは後の手動選択と統合します。
+            return points;
+        }
+
+        // --- 以下は既存のスクリプトと統合 ---
+        // originalImageInput を設定する関数を用意
+        window.setOriginalImageInput = (ctx) => {
+            originalImageInput = ctx;
+        };
+
+        // AIモードを切り替えるボタンの追加
+        document.addEventListener('DOMContentLoaded', () => {
+            const aiBtn = document.createElement('button');
+            aiBtn.id = 'aiSelectBtn';
+            aiBtn.innerText = 'AI選択';
+            aiBtn.onclick = () => setMode('ai');
+            document.getElementById('toolbar').insertBefore(aiBtn, document.getElementById('clipBtn').nextSibling);
+            document.getElementById('status').innerText = 'AIモデルをダウンロード中...';
+        });
+
+    </script>
+    <style>
+        body { font-family: sans-serif; margin: 0; background: #1a1a1a; color: white; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+        #toolbar { padding: 10px; background: #333; display: flex; gap: 8px; flex-wrap: wrap; z-index: 10; }
+        #canvas-container { flex: 1; position: relative; overflow: auto; display: flex; justify-content: center; align-items: center; background: #000; }
+        canvas { border: 1px solid #444; touch-action: none; cursor: crosshair; }
+        #parts-list { height: 120px; background: #222; display: flex; gap: 10px; padding: 10px; overflow-x: auto; border-top: 2px solid #444; }
+        .part-item { border: 2px solid #007bff; height: 100px; background: #333; }
+        button { padding: 8px 12px; border-radius: 6px; border: none; background: #007bff; color: white; font-size: 14px; }
+        .btn-green { background: #28a745; }
+        .btn-red { background: #dc3545; }
+        #status { position: fixed; bottom: 140px; left: 10px; font-size: 12px; color: #aaa; }
+        .active-mode-btn { border: 2px solid white !important; } /* アクティブモードボタンのスタイル */
+    </style>
+</head>
+<body>
+
+<div id="toolbar">
+    <input type="file" id="fileInput" accept="image/*" style="display:none">
+    <button onclick="document.getElementById('fileInput').click()">画像読込</button>
+    <button onclick="setMode('ai')" id="aiSelectBtn">AI選択</button>
+    <button onclick="setMode('clip')" id="clipBtn">手動切り抜き</button>
+    <button onclick="setMode('erase')" id="eraseBtn">穴あけ(消しゴム)</button>
+    <button class="btn-green" onclick="generatePart()">パーツ確定</button>
+    <button class="btn-red" onclick="resetCurrentPath()">リセット</button>
+</div>
+
+<div id="status">AIモデルをダウンロード中...</div>
+
+<div id="canvas-container">
+    <canvas id="mainCanvas"></canvas>
+</div>
+
+<div id="parts-list"></div>
+
+<script>
+    const canvas = document.getElementById('mainCanvas');
+    const ctx = canvas.getContext('2d');
+    const partsList = document.getElementById('parts-list');
+    
+    let baseImage = null; // 元画像
+    let offscreenCanvas = document.createElement('canvas'); // 穴あき処理用
+    let oCtx = offscreenCanvas.getContext('2d');
+    
+    let mode = 'ai'; // 'ai', 'clip' or 'erase'
+    let currentSelectionPoints = []; // 現在の選択範囲の点
+    let isDrawing = false; // 手動描画中か
+
+    // AIモジュールの originalImageInput を設定
+    window.setOriginalImageInput(oCtx); // offscreenCanvasのコンテキストを渡す
+
+    document.getElementById('fileInput').onchange = (e) => {
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+            baseImage = new Image();
+            baseImage.onload = () => {
+                canvas.width = offscreenCanvas.width = baseImage.width;
+                canvas.height = offscreenCanvas.height = baseImage.height;
+                oCtx.clearRect(0, 0, canvas.width, canvas.height); // クリア
+                oCtx.drawImage(baseImage, 0, 0); // 元画像を描画
+                window.setOriginalImageInput(oCtx); // AIモジュールに新しい画像コンテキストを渡す
+                render();
+                document.getElementById('status').innerText = '画像を読み込みました。AI選択または手動で作業してください。';
+            };
+            baseImage.src = ev.target.result;
+        };
+        reader.readAsDataURL(e.target.files[0]);
+    };
+
+    function setMode(m) {
+        mode = m;
+        document.getElementById('status').innerText = `Mode: ${m === 'ai' ? 'AI選択待機中 (タップで検出)' : m === 'clip' ? '手動切り抜き中' : '穴あけ中'}`;
+        
+        // ボタンのアクティブ状態を更新
+        document.querySelectorAll('#toolbar button').forEach(btn => btn.classList.remove('active-mode-btn'));
+        document.getElementById(m + 'Btn').classList.add('active-mode-btn');
+        resetCurrentPath(); // モード切り替え時に現在の選択をリセット
+    }
+
+    // AIモジュールから選択範囲を受け取るグローバル関数
+    window.setCurrentSelection = (points) => {
+        currentSelectionPoints = points;
+        render();
+    };
+
+    function getPos(e) {
+        const rect = canvas.getBoundingClientRect();
+        const t = e.touches ? e.touches[0] : e;
+        return {
+            x: (t.clientX - rect.left) * (canvas.width / rect.width),
+            y: (t.clientY - rect.top) * (canvas.height / rect.height)
+        };
+    }
+
+    canvas.addEventListener('touchstart', async (e) => {
+        e.preventDefault();
+        const pos = getPos(e);
+
+        if (mode === 'ai') {
+            document.getElementById('status').innerText = 'AI検出中...';
+            // AIによる自動選択をトリガー (module scriptで定義された関数を呼ぶ)
+            await window.autoSelectByAI(pos.x, pos.y);
+        } else {
+            isDrawing = true;
+            currentSelectionPoints = [pos];
+        }
+    }, {passive: false});
+
+    canvas.addEventListener('touchmove', (e) => {
+        if (!isDrawing || mode === 'ai') return; // AIモードでは手動描画しない
+        e.preventDefault();
+        currentSelectionPoints.push(getPos(e));
+        render();
+    }, {passive: false});
+
+    canvas.addEventListener('touchend', () => {
+        isDrawing = false;
+    });
+
+    function render() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(offscreenCanvas, 0, 0); // 穴があいた状態のオフスクリーンCanvasを描画
+        
+        // 現在の選択中の線を描画
+        if (currentSelectionPoints.length > 0) {
+            ctx.beginPath();
+            ctx.strokeStyle = mode === 'erase' ? '#dc3545' : '#007bff';
+            ctx.lineWidth = 5;
+            ctx.moveTo(currentSelectionPoints[0].x, currentSelectionPoints[0].y);
+            currentSelectionPoints.forEach(p => ctx.lineTo(p.x, p.y));
+            ctx.stroke();
+            ctx.closePath(); // パスを閉じる
+        }
+    }
+
+    function generatePart() {
+        if (currentSelectionPoints.length < 3) {
+            document.getElementById('status').innerText = '選択範囲が足りません。';
+            return;
+        }
+
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = canvas.width; tempCanvas.height = canvas.height;
+        const tempCtx = tempCanvas.getContext('2d');
+
+        // クリッピングパスを作成
+        tempCtx.beginPath();
+        currentSelectionPoints.forEach((p, i) => i === 0 ? tempCtx.moveTo(p.x, p.y) : tempCtx.lineTo(p.x, p.y));
+        tempCtx.closePath();
+
+        if (mode === 'erase') {
+            // --- 穴あけ（消しゴム）処理 ---
+            oCtx.globalCompositeOperation = 'destination-out'; // 描画した部分を透明にする
+            oCtx.fill(tempCtx.path); // パスで穴を開ける
+            oCtx.globalCompositeOperation = 'source-over'; // 元に戻す
+            document.getElementById('status').innerText = '選択範囲を削除し、穴を開けました。';
+        } else { // mode === 'ai' or 'clip'
+            // --- パーツ切り出し処理 ---
+            tempCtx.clip(); // パスでクリッピング
+            tempCtx.drawImage(offscreenCanvas, 0, 0); // 現在の「穴あき」状態から切り出す
+
+            const img = new Image();
+            img.src = tempCanvas.toDataURL();
+            img.className = 'part-item';
+            partsList.appendChild(img);
+            document.getElementById('status').innerText = 'パーツを切り出しました。';
+        }
+        resetCurrentPath();
+    }
+
+    function resetCurrentPath() { 
+        currentSelectionPoints = []; 
+        render(); 
+        document.getElementById('status').innerText = `Mode: ${mode === 'ai' ? 'AI選択待機中 (タップで検出)' : mode === 'clip' ? '手動切り抜き中' : '穴あけ中'}`;
+    }
+
+    // 初期モード設定
+    setMode('ai');
+
+</script>
+
+</body>
+</html>
